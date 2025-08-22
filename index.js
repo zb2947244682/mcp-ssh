@@ -127,36 +127,113 @@ server.registerTool("connect_ssh",
         commandCount: 0
       };
       
-      // 连接配置
+      // 连接配置 - 优化以减少延迟
       const config = {
         host,
         port,
         username,
         privateKey: Buffer.from(privateKey, 'utf8'),
-        readyTimeout: 30000, // 30秒超时
-        keepaliveInterval: 30000, // 30秒心跳
-        keepaliveCountMax: 3
+        readyTimeout: 5000, // 5秒超时
+        keepaliveInterval: 5000, // 5秒心跳
+        keepaliveCountMax: 3,
+        algorithms: {
+          serverHostKey: ['ssh-rsa', 'ssh-dss', 'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521', 'ssh-ed25519']
+        },
+        // 减少连接延迟的设置
+        tryKeyboard: false,
+        lookForKeys: false,
+        // 禁用一些可能导致延迟的功能
+        compress: false
       };
+      
+      // 验证私钥格式
+      if (!privateKey.includes('-----BEGIN OPENSSH PRIVATE KEY-----') || 
+          !privateKey.includes('-----END OPENSSH PRIVATE KEY-----')) {
+        throw new Error('私钥格式错误：必须是OpenSSH格式的PEM私钥');
+      }
       
       if (passphrase) {
         config.passphrase = passphrase;
       }
       
-      // 建立连接
+            // 建立连接 - 使用更可靠的异步处理
       await new Promise((resolve, reject) => {
+        let isResolved = false;
+        let connectionStartTime = Date.now();
+        
+        // 添加严格的超时控制
+        const timeoutId = setTimeout(() => {
+          if (!isResolved) {
+            isResolved = true;
+            console.log(`[DEBUG] 连接超时，强制结束连接 ${host}:${port}`);
+            try {
+              client.end();
+            } catch (e) {
+              // 忽略结束时的错误
+            }
+            reject(new Error(`SSH连接超时 (5秒) - 已等待 ${Date.now() - connectionStartTime}ms`));
+          }
+        }, 5000);
+        
+        // 添加连接开始事件监听
         client.on('ready', () => {
-          resolve();
+          if (!isResolved) {
+            isResolved = true;
+            clearTimeout(timeoutId);
+            console.log(`[DEBUG] SSH连接就绪 ${host}:${port}`);
+            resolve();
+          }
         });
         
         client.on('error', (err) => {
-          reject(new Error(`SSH连接错误: ${err.message}`));
+          if (!isResolved) {
+            isResolved = true;
+            clearTimeout(timeoutId);
+            console.log(`[DEBUG] SSH连接错误 ${host}:${port}: ${err.message}`);
+            reject(new Error(`SSH连接错误: ${err.message}`));
+          }
         });
         
         client.on('timeout', () => {
-          reject(new Error('SSH连接超时'));
+          if (!isResolved) {
+            isResolved = true;
+            clearTimeout(timeoutId);
+            console.log(`[DEBUG] SSH连接超时 ${host}:${port}`);
+            reject(new Error('SSH连接超时'));
+          }
         });
         
-        client.connect(config);
+        client.on('end', () => {
+          if (!isResolved) {
+            isResolved = true;
+            clearTimeout(timeoutId);
+            console.log(`[DEBUG] SSH连接被远程关闭 ${host}:${port}`);
+            reject(new Error('SSH连接被远程关闭'));
+          }
+        });
+        
+        // 添加更多事件监听器
+        client.on('close', (hadError) => {
+          if (!isResolved) {
+            isResolved = true;
+            clearTimeout(timeoutId);
+            console.log(`[DEBUG] SSH连接关闭 ${host}:${port}, 有错误: ${hadError}`);
+            reject(new Error('SSH连接被关闭'));
+          }
+        });
+        
+        // 尝试连接
+        try {
+          console.log(`[DEBUG] 开始连接 ${host}:${port}...`);
+          client.connect(config);
+        } catch (connectError) {
+          if (!isResolved) {
+            isResolved = true;
+            clearTimeout(timeoutId);
+            console.log(`[DEBUG] 连接启动失败 ${host}:${port}: ${connectError.message}`);
+            reject(new Error(`连接启动失败: ${connectError.message}`));
+          }
+        }
       });
       
       // 连接成功，存储连接信息
@@ -225,10 +302,10 @@ server.registerTool("execute_command",
     inputSchema: { 
       connectionId: z.string().min(1, "连接ID不能为空").describe("SSH连接的ID"),
       command: z.string().min(1, "命令不能为空").describe("要执行的命令"),
-      timeout: z.number().min(1000).max(300000).default(30000).describe("命令执行超时时间(毫秒)")
+      timeout: z.number().min(1000).max(300000).default(5000).describe("命令执行超时时间(毫秒)")
     }
   },
-  async ({ connectionId, command, timeout = 30000 }) => {
+  async ({ connectionId, command, timeout = 5000 }) => {
     const startTime = Date.now();
     
     try {
