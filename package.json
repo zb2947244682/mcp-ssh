@@ -1,0 +1,36 @@
+{
+  "name": "@zb2947244682/mcp-ssh",
+  "version": "1.0.0",
+  "description": "MCP tool for SSH connection and remote command execution",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zb2947244682/MCP-SSH"
+  },
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "mcp-ssh": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md",
+    "PUBLISHING.md"
+  ],
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "MCP",
+    "SSH",
+    "remote",
+    "command",
+    "execution"
+  ],
+  "author": "简单生活",
+  "license": "ISC",
+  "dependencies": {
+    "ssh2": "^1.15.0",
+    "@modelcontextprotocol/sdk": "^1.17.3",
+    "zod": "^3.23.8"
+  }
+}
