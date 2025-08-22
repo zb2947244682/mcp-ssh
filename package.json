@@ -1,6 +1,6 @@
 {
   "name": "@zb2947244682/mcp-ssh",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "用于SSH连接和远程命令执行的MCP工具",
   "homepage": "https://github.com/zb2947244682",
   "repository": {
