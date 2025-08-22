@@ -120,6 +120,19 @@
 npx @zb2947244682/mcp-ssh
 ```
 
+## 本地开发配置
+
+如果您在本地开发环境中使用，可以将以下配置添加到您的 Cursor `mcp.json` 文件中：
+
+```json
+{
+  "mcp-ssh": {
+    "command": "node",
+    "args": ["D:\\Codes\\MCPRepo\\mcp-ssh\\index.js"]
+  }
+}
+```
+
 ## 🔧 特性
 
 - ✅ **安全连接** - 支持SSH私钥认证

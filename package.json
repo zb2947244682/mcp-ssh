@@ -1,10 +1,11 @@
 {
   "name": "@zb2947244682/mcp-ssh",
   "version": "1.0.0",
-  "description": "MCP tool for SSH connection and remote command execution",
+  "description": "用于SSH连接和远程命令执行的MCP工具",
+  "homepage": "https://github.com/zb2947244682",
   "repository": {
     "type": "git",
-    "url": "https://github.com/zb2947244682/MCP-SSH"
+    "url": "https://github.com/zb2947244682/mcp-ssh"
   },
   "main": "index.js",
   "type": "module",
