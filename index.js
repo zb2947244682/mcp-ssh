@@ -1,4 +1,27 @@
 #!/usr/bin/env node
+/**
+ * MCP-SSH 服务器
+ * 
+ * 这是一个精简而强大的SSH管理工具，提供4个核心工具：
+ * 1. ssh_connection - SSH连接管理（连接/断开）
+ * 2. ssh_execute - 命令执行（支持工作目录管理）
+ * 3. ssh_file_operation - 文件操作（SFTP传输）
+ * 4. ssh_status - 连接状态查看
+ * 
+ * 特点：
+ * - 支持私钥文件路径和直接输入两种方式
+ * - 自动工作目录管理，cd命令状态保持
+ * - 完整的SFTP文件传输功能
+ * - 智能错误处理和超时控制
+ * 
+ * 使用流程：
+ * 1. 使用 ssh_connection 建立连接
+ * 2. 使用 ssh_execute 执行命令
+ * 3. 使用 ssh_file_operation 进行文件操作
+ * 4. 使用 ssh_status 监控连接状态
+ * 5. 使用 ssh_connection 断开连接
+ */
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -38,17 +61,17 @@ function cleanupConnection(connectionId) {
 server.registerTool("ssh_connection",
   {
     title: "SSH连接管理",
-    description: "连接或断开SSH服务器",
+    description: "建立SSH连接或断开现有连接。支持私钥文件路径和直接输入两种方式，自动管理连接状态。",
     inputSchema: { 
       action: z.enum(["connect", "disconnect"]).describe("操作类型：connect连接，disconnect断开"),
-      host: z.string().optional().describe("主机地址（连接时必需）"),
-      port: z.number().min(1).max(65535).default(22).describe("SSH端口号"),
-      username: z.string().optional().describe("用户名（连接时必需）"),
-      privateKey: z.string().optional().describe("SSH私钥内容（PEM格式）"),
-      privateKeyPath: z.string().optional().describe("SSH私钥文件路径（绝对路径）"),
-      passphrase: z.string().optional().describe("私钥密码（如果有的话）"),
-      connectionName: z.string().optional().describe("连接名称（用于标识连接）"),
-      connectionId: z.string().optional().describe("连接ID（断开时必需）")
+      host: z.string().optional().describe("主机地址（连接时必需，如：192.168.1.100 或 example.com）"),
+      port: z.number().min(1).max(65535).default(22).describe("SSH端口号（默认22）"),
+      username: z.string().optional().describe("用户名（连接时必需，如：root、ubuntu等）"),
+      privateKey: z.string().optional().describe("SSH私钥内容（PEM格式，与privateKeyPath二选一）"),
+      privateKeyPath: z.string().optional().describe("SSH私钥文件路径（绝对路径，推荐使用，如：C:\\Users\\username\\.ssh\\id_rsa）"),
+      passphrase: z.string().optional().describe("私钥密码（如果私钥有密码保护）"),
+      connectionName: z.string().optional().describe("连接名称（用于标识连接，如：生产服务器、测试环境等）"),
+      connectionId: z.string().optional().describe("连接ID（断开连接时必需，从连接成功后的返回信息中获取）")
     }
   },
   async ({ action, host, port = 22, username, privateKey, privateKeyPath, passphrase, connectionName, connectionId }) => {
@@ -191,12 +214,12 @@ server.registerTool("ssh_connection",
 server.registerTool("ssh_execute",
   {
     title: "执行SSH命令",
-    description: "在已连接的SSH会话中执行命令",
+    description: "在已连接的SSH会话中执行命令。支持工作目录管理，cd命令会自动更新工作目录状态，其他命令会在当前工作目录下执行。",
     inputSchema: { 
-      connectionId: z.string().min(1, "连接ID不能为空").describe("SSH连接的ID"),
-      command: z.string().min(1, "命令不能为空").describe("要执行的命令"),
-      workingDirectory: z.string().optional().describe("指定工作目录（可选）"),
-      timeout: z.number().min(1000).max(300000).default(10000).describe("命令执行超时时间(毫秒)")
+      connectionId: z.string().min(1, "连接ID不能为空").describe("SSH连接的ID（从ssh_connection工具获取）"),
+      command: z.string().min(1, "命令不能为空").describe("要执行的命令（如：ls -la、cd /var/www、pwd等）"),
+      workingDirectory: z.string().optional().describe("强制指定工作目录（可选，会覆盖当前工作目录）"),
+      timeout: z.number().min(1000).max(300000).default(10000).describe("命令执行超时时间（毫秒，默认10秒）")
     }
   },
   async ({ connectionId, command, workingDirectory, timeout = 10000 }) => {
@@ -318,13 +341,13 @@ server.registerTool("ssh_execute",
 server.registerTool("ssh_file_operation",
   {
     title: "SSH文件操作",
-    description: "支持文件上传、下载、列表查看、删除等操作",
+    description: "通过SFTP协议进行文件操作，支持上传、下载、列表查看、删除、创建目录等。所有操作都基于已建立的SSH连接。",
     inputSchema: { 
-      connectionId: z.string().min(1, "连接ID不能为空").describe("SSH连接的ID"),
-      operation: z.enum(["upload", "download", "list", "delete", "mkdir", "rmdir"]).describe("操作类型"),
-      remotePath: z.string().min(1, "远程路径不能为空").describe("远程文件/目录路径"),
-      localPath: z.string().optional().describe("本地文件/目录路径（上传/下载时需要）"),
-      timeout: z.number().min(10000).max(300000).default(30000).describe("操作超时时间(毫秒)")
+      connectionId: z.string().min(1, "连接ID不能为空").describe("SSH连接的ID（从ssh_connection工具获取）"),
+      operation: z.enum(["upload", "download", "list", "delete", "mkdir", "rmdir"]).describe("操作类型：upload(上传)、download(下载)、list(列表)、delete(删除)、mkdir(创建目录)、rmdir(删除目录)"),
+      remotePath: z.string().min(1, "远程路径不能为空").describe("远程文件/目录路径（如：/var/www/index.html、/tmp/testdir）"),
+      localPath: z.string().optional().describe("本地文件/目录路径（上传/下载时需要，如：C:\\Users\\username\\file.txt）"),
+      timeout: z.number().min(10000).max(300000).default(30000).describe("操作超时时间（毫秒，默认30秒）")
     }
   },
   async ({ connectionId, operation, remotePath, localPath, timeout = 30000 }) => {
@@ -413,9 +436,9 @@ server.registerTool("ssh_file_operation",
 server.registerTool("ssh_status",
   {
     title: "SSH连接状态",
-    description: "查看SSH连接的状态和统计信息",
+    description: "查看SSH连接的状态、工作目录和统计信息。可以查看特定连接的详细信息或所有连接的概览。",
     inputSchema: { 
-      connectionId: z.string().optional().describe("查看特定连接的详细信息（可选）")
+      connectionId: z.string().optional().describe("查看特定连接的详细信息（可选，不提供则显示所有连接概览）")
     }
   },
   async ({ connectionId }) => {
@@ -443,12 +466,12 @@ server.registerTool("ssh_status",
 
       // 查看所有连接概览
       if (sshConnections.size === 0) {
-        return {
-          content: [{ 
-            type: "text", 
-            text: `SSH连接状态\n\n当前无活跃连接\n\n使用说明:\n1. ssh_connection - 连接或断开SSH服务器\n2. ssh_execute - 在已连接的SSH会话中执行命令\n3. ssh_file_operation - 文件上传/下载/管理\n4. ssh_status - 查看连接状态` 
-          }]
-        };
+              return {
+        content: [{ 
+          type: "text", 
+          text: `SSH连接状态\n\n当前无活跃连接\n\n使用说明:\n1. ssh_connection - 建立或断开SSH连接（必需第一步）\n2. ssh_execute - 执行命令，支持工作目录管理\n3. ssh_file_operation - 文件传输和管理操作\n4. ssh_status - 查看连接状态和详细信息` 
+        }]
+      };
       }
 
       const connectionsText = Array.from(sshConnections.values())
@@ -461,7 +484,7 @@ server.registerTool("ssh_status",
       return {
         content: [{ 
           type: "text", 
-          text: `SSH连接状态\n\n活跃连接数: ${sshConnections.size}\n\n连接详情:\n${connectionsText}\n\n使用说明:\n1. ssh_connection - 连接或断开SSH服务器\n2. ssh_execute - 在已连接的SSH会话中执行命令\n3. ssh_file_operation - 文件上传/下载/管理\n4. ssh_status - 查看连接状态` 
+          text: `SSH连接状态\n\n活跃连接数: ${sshConnections.size}\n\n连接详情:\n${connectionsText}\n\n使用说明:\n1. ssh_connection - 建立或断开SSH连接（必需第一步）\n2. ssh_execute - 执行命令，支持工作目录管理\n3. ssh_file_operation - 文件传输和管理操作\n4. ssh_status - 查看连接状态和详细信息` 
         }]
       };
 
