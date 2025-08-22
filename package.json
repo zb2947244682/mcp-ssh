@@ -2,7 +2,7 @@
   "name": "@zb2947244682/mcp-ssh",
   "version": "1.0.2",
   "description": "用于SSH连接和远程命令执行的MCP工具",
-  "homepage": "https://github.com/zb2947244682",
+  "homepage": "https://www.npmjs.com/~zb2947244682",
   "repository": {
     "type": "git",
     "url": "https://github.com/zb2947244682/mcp-ssh"

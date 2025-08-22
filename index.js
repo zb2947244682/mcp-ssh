@@ -20,6 +20,7 @@ const server = new McpServer({
 
 // SSH连接管理
 let sshConnections = new Map(); // 存储活跃的SSH连接
+let sshSessions = new Map(); // 存储SSH会话状态
 let connectionStats = {
   totalConnections: 0,
   activeConnections: 0,
@@ -76,6 +77,13 @@ function cleanupConnection(connectionId) {
     }
     sshConnections.delete(connectionId);
     updateConnectionStats('disconnect');
+    
+    // 清理相关的会话
+    for (const [sessionId, session] of sshSessions.entries()) {
+      if (session.connectionId === connectionId) {
+        sshSessions.delete(sessionId);
+      }
+    }
   }
 }
 
@@ -147,7 +155,8 @@ server.registerTool("connect_ssh",
         client,
         connectedAt: getCurrentTimestamp(),
         lastActivity: getCurrentTimestamp(),
-        commandCount: 0
+        commandCount: 0,
+        workingDirectory: '/root' // 添加工作目录跟踪
       };
       
       // 连接配置 - 优化以减少延迟
@@ -330,10 +339,11 @@ server.registerTool("execute_command",
     inputSchema: { 
       connectionId: z.string().min(1, "连接ID不能为空").describe("SSH连接的ID"),
       command: z.string().min(1, "命令不能为空").describe("要执行的命令"),
-      timeout: z.number().min(1000).max(300000).default(5000).describe("命令执行超时时间(毫秒)")
+      timeout: z.number().min(1000).max(300000).default(5000).describe("命令执行超时时间(毫秒)"),
+      changeDirectory: z.boolean().default(false).describe("是否在执行命令前先切换到指定目录")
     }
   },
-  async ({ connectionId, command, timeout = 5000 }) => {
+  async ({ connectionId, command, timeout = 5000, changeDirectory = false }) => {
     const startTime = Date.now();
     
     try {
@@ -376,13 +386,19 @@ ${Array.from(sshConnections.values()).map(conn => `- ${conn.name} (ID: ${conn.id
         };
       }
       
+      // 构建完整命令（包含目录切换）
+      let fullCommand = command;
+      if (changeDirectory && connection.workingDirectory !== '/root') {
+        fullCommand = `cd ${connection.workingDirectory} && ${command}`;
+      }
+      
       // 执行命令
       const result = await new Promise((resolve, reject) => {
         const timeoutId = setTimeout(() => {
           reject(new Error(`命令执行超时 (${timeout}ms)`));
         }, timeout);
         
-        connection.client.exec(command, (err, stream) => {
+        connection.client.exec(fullCommand, (err, stream) => {
           if (err) {
             clearTimeout(timeoutId);
             reject(new Error(`命令执行错误: ${err.message}`));
@@ -474,6 +490,533 @@ ${result.stderr}`;
 
 ⏱️ 执行时间: ${executionTime}ms
 🔗 连接ID: ${connectionId}
+📝 命令: ${command}
+
+💡 可能的原因:
+1. 命令语法错误
+2. 权限不足
+3. 网络连接问题
+4. 命令执行超时
+5. SSH连接已断开
+
+🔍 建议:
+1. 检查命令语法是否正确
+2. 确认用户权限是否足够
+3. 尝试重新连接SSH` 
+          }
+        ]
+      };
+    }
+  }
+);
+
+// 注册交互式SSH终端工具
+server.registerTool("interactive_ssh",
+  {
+    title: "交互式SSH终端",
+    description: "启动一个完整的交互式SSH终端会话，支持命令历史、工作目录保持等",
+    inputSchema: { 
+      connectionId: z.string().min(1, "连接ID不能为空").describe("SSH连接的ID"),
+      sessionName: z.string().optional().describe("会话名称（用于标识会话）"),
+      initialDirectory: z.string().optional().describe("初始工作目录（默认为用户主目录）")
+    }
+  },
+  async ({ connectionId, sessionName, initialDirectory }) => {
+    try {
+      // 检查连接是否存在
+      const connection = sshConnections.get(connectionId);
+      if (!connection) {
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 启动失败: 未找到连接ID为 ${connectionId} 的SSH连接
+
+💡 请使用 connect_ssh 工具建立连接，或检查连接ID是否正确。` 
+            }
+          ]
+        };
+      }
+      
+      // 检查连接是否仍然活跃
+      if (!connection.client || connection.client.closed) {
+        cleanupConnection(connectionId);
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 启动失败: SSH连接已断开
+
+🔗 连接信息:
+- 连接ID: ${connectionId}
+- 连接名称: ${connection.name}
+- 服务器: ${connection.host}:${connection.port}
+
+💡 请重新使用 connect_ssh 工具建立连接。` 
+            }
+          ]
+        };
+      }
+      
+      // 创建会话ID
+      const sessionId = generateConnectionId();
+      const session = {
+        id: sessionId,
+        name: sessionName || `会话_${sessionId}`,
+        connectionId,
+        workingDirectory: initialDirectory || connection.workingDirectory || '/root',
+        commandHistory: [],
+        environment: {},
+        startedAt: getCurrentTimestamp(),
+        lastActivity: getCurrentTimestamp(),
+        isActive: true
+      };
+      
+      // 存储会话信息
+      sshSessions.set(sessionId, session);
+      
+      // 初始化工作目录
+      if (initialDirectory && initialDirectory !== '/root') {
+        try {
+          await new Promise((resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+              reject(new Error('目录切换超时'));
+            }, 5000);
+            
+            connection.client.exec(`cd ${initialDirectory} && pwd`, (err, stream) => {
+              if (err) {
+                clearTimeout(timeoutId);
+                reject(new Error(`目录切换失败: ${err.message}`));
+                return;
+              }
+              
+              let stdout = '';
+              stream.on('data', (data) => {
+                stdout += data.toString();
+              });
+              
+              stream.on('close', (code) => {
+                clearTimeout(timeoutId);
+                if (code === 0) {
+                  session.workingDirectory = stdout.trim();
+                  resolve();
+                } else {
+                  reject(new Error('目录不存在或无权限'));
+                }
+              });
+            });
+          });
+        } catch (error) {
+          // 如果目录切换失败，使用默认目录
+          session.workingDirectory = '/root';
+        }
+      }
+      
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: `🚀 交互式SSH终端已启动！
+
+🔗 会话信息:
+- 会话ID: ${sessionId}
+- 会话名称: ${session.name}
+- 连接名称: ${connection.name}
+- 服务器: ${connection.host}:${connection.port}
+- 当前工作目录: ${session.workingDirectory}
+- 启动时间: ${session.startedAt}
+
+💡 使用说明:
+1. 使用 execute_in_session 工具在会话中执行命令
+2. 使用 get_session_info 工具查看会话状态
+3. 使用 close_session 工具关闭会话
+4. 会话会自动保持工作目录和命令历史
+
+📝 支持的功能:
+- 工作目录保持
+- 命令历史记录
+- 环境变量保持
+- 会话状态管理
+
+🎯 现在可以在 ${session.workingDirectory} 目录下执行命令了！` 
+          }
+        ]
+      };
+      
+    } catch (error) {
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: `❌ 启动交互式终端失败: ${error.message}
+
+🔗 连接ID: ${connectionId}
+
+💡 请检查连接状态，或尝试重新连接。` 
+          }
+        ]
+      };
+    }
+  }
+);
+
+// 注册目录切换工具
+server.registerTool("change_directory",
+  {
+    title: "切换工作目录",
+    description: "切换SSH连接的工作目录",
+    inputSchema: { 
+      connectionId: z.string().min(1, "连接ID不能为空").describe("SSH连接的ID"),
+      directory: z.string().min(1, "目录路径不能为空").describe("要切换到的目录路径"),
+      timeout: z.number().min(1000).max(30000).default(5000).describe("操作超时时间(毫秒)")
+    }
+  },
+  async ({ connectionId, directory, timeout = 5000 }) => {
+    const startTime = Date.now();
+    
+    try {
+      // 检查连接是否存在
+      const connection = sshConnections.get(connectionId);
+      if (!connection) {
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 操作失败: 未找到连接ID为 ${connectionId} 的SSH连接
+
+💡 请使用 connect_ssh 工具建立连接，或检查连接ID是否正确。` 
+            }
+          ]
+        };
+      }
+      
+      // 检查连接是否仍然活跃
+      if (!connection.client || connection.client.closed) {
+        cleanupConnection(connectionId);
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 操作失败: SSH连接已断开
+
+🔗 连接信息:
+- 连接ID: ${connectionId}
+- 连接名称: ${connection.name}
+- 服务器: ${connection.host}:${connection.port}
+
+💡 请重新使用 connect_ssh 工具建立连接。` 
+            }
+          ]
+        };
+      }
+      
+      // 验证目录是否存在
+      const result = await new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+          reject(new Error(`目录检查超时 (${timeout}ms)`));
+        }, timeout);
+        
+        connection.client.exec(`cd ${directory} && pwd`, (err, stream) => {
+          if (err) {
+            clearTimeout(timeoutId);
+            reject(new Error(`目录切换失败: ${err.message}`));
+            return;
+          }
+          
+          let stdout = '';
+          let stderr = '';
+          
+          stream.on('data', (data) => {
+            stdout += data.toString();
+          });
+          
+          stream.stderr.on('data', (data) => {
+            stderr += data.toString();
+          });
+          
+          stream.on('close', (code) => {
+            clearTimeout(timeoutId);
+            if (code === 0) {
+              resolve(stdout.trim());
+            } else {
+              reject(new Error(`目录不存在或无权限: ${stderr.trim() || directory}`));
+            }
+          });
+        });
+      });
+      
+      // 更新工作目录
+      connection.workingDirectory = result;
+      connection.lastActivity = getCurrentTimestamp();
+      
+      const executionTime = Date.now() - startTime;
+      updateConnectionStats('command_success', executionTime);
+      
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: `✅ 工作目录切换成功
+
+🔗 连接信息:
+- 连接ID: ${connectionId}
+- 连接名称: ${connection.name}
+- 服务器: ${connection.host}:${connection.port}
+- 新工作目录: ${result}
+- 执行时间: ${executionTime}ms
+
+💡 现在可以使用 execute_command 工具执行命令，系统会自动在当前工作目录下执行。
+
+📊 连接统计:
+- 最后活动: ${connection.lastActivity}` 
+          }
+        ]
+      };
+      
+    } catch (error) {
+      const executionTime = Date.now() - startTime;
+      updateConnectionStats('command_failed');
+      
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: `❌ 目录切换失败: ${error.message}
+
+⏱️ 执行时间: ${executionTime}ms
+🔗 连接ID: ${connectionId}
+📝 目标目录: ${directory}
+
+💡 可能的原因:
+1. 目录不存在
+2. 权限不足
+3. 路径格式错误
+
+🔍 建议:
+1. 检查目录路径是否正确
+2. 确认用户权限是否足够
+3. 使用绝对路径` 
+          }
+        ]
+      };
+    }
+  }
+);
+
+// 注册在会话中执行命令的工具
+server.registerTool("execute_in_session",
+  {
+    title: "在会话中执行命令",
+    description: "在交互式SSH会话中执行命令，保持工作目录和状态",
+    inputSchema: { 
+      sessionId: z.string().min(1, "会话ID不能为空").describe("SSH会话的ID"),
+      command: z.string().min(1, "命令不能为空").describe("要执行的命令"),
+      timeout: z.number().min(1000).max(300000).default(10000).describe("命令执行超时时间(毫秒)")
+    }
+  },
+  async ({ sessionId, command, timeout = 10000 }) => {
+    const startTime = Date.now();
+    
+    try {
+      // 检查会话是否存在
+      const session = sshSessions.get(sessionId);
+      if (!session) {
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 执行失败: 未找到会话ID为 ${sessionId} 的SSH会话
+
+💡 请使用 interactive_ssh 工具启动会话，或检查会话ID是否正确。
+
+📋 当前活跃会话:
+${Array.from(sshSessions.values()).map(sess => `- ${sess.name} (ID: ${sess.id})`).join('\n') || '无活跃会话'}` 
+            }
+          ]
+        };
+      }
+      
+      // 检查会话是否活跃
+      if (!session.isActive) {
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 执行失败: 会话已关闭
+
+🔗 会话信息:
+- 会话ID: ${sessionId}
+- 会话名称: ${session.name}
+- 状态: 已关闭
+
+💡 请重新启动会话。` 
+            }
+          ]
+        };
+      }
+      
+      // 检查连接是否仍然活跃
+      const connection = sshConnections.get(session.connectionId);
+      if (!connection || !connection.client || connection.client.closed) {
+        // 清理断开的连接和会话
+        cleanupConnection(session.connectionId);
+        sshSessions.delete(sessionId);
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 执行失败: SSH连接已断开
+
+🔗 会话信息:
+- 会话ID: ${sessionId}
+- 会话名称: ${session.name}
+
+💡 请重新使用 connect_ssh 工具建立连接。` 
+            }
+          ]
+        };
+      }
+      
+      // 构建完整命令（包含目录切换和环境变量）
+      let fullCommand = command;
+      let shouldUpdateWorkingDirectory = false;
+      
+      // 如果是cd命令，需要特殊处理
+      if (command.trim().startsWith('cd ')) {
+        const targetDir = command.trim().substring(3).trim();
+        shouldUpdateWorkingDirectory = true;
+        
+        // 处理相对路径和绝对路径
+        if (targetDir.startsWith('/')) {
+          // 绝对路径
+          fullCommand = `cd ${targetDir} && pwd`;
+        } else if (targetDir === '-' || targetDir === '~') {
+          // 特殊目录
+          fullCommand = `cd ${targetDir} && pwd`;
+        } else {
+          // 相对路径，需要基于当前工作目录
+          fullCommand = `cd ${session.workingDirectory}/${targetDir} && pwd`;
+        }
+      } else {
+        // 非cd命令，添加工作目录前缀
+        if (session.workingDirectory !== '/root') {
+          fullCommand = `cd ${session.workingDirectory} && ${command}`;
+        }
+      }
+      
+      // 执行命令
+      const result = await new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+          reject(new Error(`命令执行超时 (${timeout}ms)`));
+        }, timeout);
+        
+        connection.client.exec(fullCommand, (err, stream) => {
+          if (err) {
+            clearTimeout(timeoutId);
+            reject(new Error(`命令执行错误: ${err.message}`));
+            return;
+          }
+          
+          let stdout = '';
+          let stderr = '';
+          
+          stream.on('data', (data) => {
+            stdout += data.toString();
+          });
+          
+          stream.stderr.on('data', (data) => {
+            stderr += data.toString();
+          });
+          
+          stream.on('close', (code) => {
+            clearTimeout(timeoutId);
+            resolve({
+              code,
+              stdout: stdout.trim(),
+              stderr: stderr.trim()
+            });
+          });
+          
+          stream.on('error', (err) => {
+            clearTimeout(timeoutId);
+            reject(new Error(`流错误: ${err.message}`));
+          });
+        });
+      });
+      
+      // 更新会话状态
+      session.lastActivity = getCurrentTimestamp();
+      session.commandHistory.push({
+        command: command.trim(),
+        timestamp: getCurrentTimestamp(),
+        exitCode: result.code,
+        workingDirectory: session.workingDirectory
+      });
+      
+      // 如果是cd命令，更新工作目录
+      if (shouldUpdateWorkingDirectory && result.code === 0) {
+        const lines = result.stdout.split('\n');
+        const newDir = lines[lines.length - 1].trim();
+        if (newDir && newDir.startsWith('/')) {
+          session.workingDirectory = newDir;
+          console.log(`[DEBUG] 工作目录已更新: ${newDir}`);
+        }
+      }
+      
+      // 更新连接统计
+      connection.commandCount++;
+      updateConnectionStats('command_success', Date.now() - startTime);
+      
+      // 格式化输出
+      const statusIcon = result.code === 0 ? '✅' : '⚠️';
+      const statusText = result.code === 0 ? '成功' : `失败 (退出码: ${result.code})`;
+      
+      let outputText = `${statusIcon} 命令执行${statusText}
+
+🔗 会话信息:
+- 会话ID: ${sessionId}
+- 会话名称: ${session.name}
+- 当前工作目录: ${session.workingDirectory}
+- 执行时间: ${Date.now() - startTime}ms
+- 退出码: ${result.code}
+
+📝 执行的命令:
+\`\`\`bash
+${command}
+\`\`\`
+
+📤 标准输出:
+${result.stdout || '[无输出]'}`;
+
+      if (result.stderr) {
+        outputText += `\n\n❌ 错误输出:
+${result.stderr}`;
+      }
+      
+      outputText += `\n\n📊 会话统计:
+- 命令历史数量: ${session.commandHistory.length}
+- 最后活动: ${session.lastActivity}`;
+      
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: outputText
+          }
+        ]
+      };
+      
+    } catch (error) {
+      updateConnectionStats('command_failed');
+      
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: `❌ 命令执行失败: ${error.message}
+
+⏱️ 执行时间: ${Date.now() - startTime}ms
+🔗 会话ID: ${sessionId}
 📝 命令: ${command}
 
 💡 可能的原因:
@@ -919,6 +1462,437 @@ async function removeDirectory(client, remotePath, timeout) {
   });
 }
 
+// 注册会话信息查看工具
+server.registerTool("get_session_info",
+  {
+    title: "查看会话信息",
+    description: "查看交互式SSH会话的详细信息和状态",
+    inputSchema: { 
+      sessionId: z.string().min(1, "会话ID不能为空").describe("要查看的SSH会话ID")
+    }
+  },
+  async ({ sessionId }) => {
+    try {
+      // 检查会话是否存在
+      const session = sshSessions.get(sessionId);
+      if (!session) {
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 查看失败: 未找到会话ID为 ${sessionId} 的SSH会话
+
+💡 请使用 interactive_ssh 工具启动会话，或检查会话ID是否正确。` 
+            }
+          ]
+        };
+      }
+      
+      // 获取连接信息
+      const connection = sshConnections.get(session.connectionId);
+      const connectionInfo = connection ? 
+        `${connection.name} (${connection.host}:${connection.port})` : 
+        '连接已断开';
+      
+      // 格式化命令历史
+      const commandHistoryText = session.commandHistory.length > 0 ?
+        session.commandHistory.slice(-10).map((hist, index) => {
+          const time = new Date(hist.timestamp).toLocaleTimeString();
+          const status = hist.exitCode === 0 ? '✅' : '❌';
+          return `${index + 1}. ${time} ${status} \`${hist.command}\` (${hist.workingDirectory})`;
+        }).join('\n') : '无命令历史';
+      
+      // 计算会话时长
+      const startedAt = new Date(session.startedAt);
+      const now = new Date();
+      const duration = Math.floor((now - startedAt) / 1000);
+      
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: `📋 SSH会话详细信息
+
+🔗 会话基本信息:
+- 会话ID: ${session.id}
+- 会话名称: ${session.name}
+- 连接信息: ${connectionInfo}
+- 状态: ${session.isActive ? '🟢 活跃' : '🔴 已关闭'}
+- 启动时间: ${session.startedAt}
+- 会话时长: ${duration}秒
+- 最后活动: ${session.lastActivity}
+
+📁 当前状态:
+- 工作目录: ${session.workingDirectory}
+- 命令历史数量: ${session.commandHistory.length}
+
+📝 最近命令历史 (最近10条):
+${commandHistoryText}
+
+💡 使用说明:
+- 使用 execute_in_session 工具在会话中执行命令
+- 使用 close_session 工具关闭会话
+- 会话会自动保持工作目录和命令历史` 
+          }
+        ]
+      };
+      
+    } catch (error) {
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: `❌ 获取会话信息失败: ${error.message}
+
+🔗 会话ID: ${sessionId}` 
+          }
+        ]
+      };
+    }
+  }
+);
+
+// 注册工作目录重置工具
+server.registerTool("reset_working_directory",
+  {
+    title: "重置工作目录",
+    description: "重置SSH会话的工作目录到指定路径",
+    inputSchema: { 
+      sessionId: z.string().min(1, "会话ID不能为空").describe("要重置的SSH会话ID"),
+      directory: z.string().min(1, "目标工作目录路径").describe("要设置的工作目录路径")
+    }
+  },
+  async ({ sessionId, directory }) => {
+    try {
+      // 检查会话是否存在
+      const session = sshSessions.get(sessionId);
+      if (!session) {
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 重置失败: 未找到会话ID为 ${sessionId} 的SSH会话` 
+            }
+          ]
+        };
+      }
+      
+      // 检查连接是否仍然活跃
+      const connection = sshConnections.get(session.connectionId);
+      if (!connection || !connection.client || connection.client.closed) {
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 重置失败: SSH连接已断开` 
+            }
+          ]
+        };
+      }
+      
+      // 验证目录是否存在
+      const result = await new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+          reject(new Error('目录检查超时'));
+        }, 5000);
+        
+        connection.client.exec(`cd ${directory} && pwd`, (err, stream) => {
+          if (err) {
+            clearTimeout(timeoutId);
+            reject(new Error(`目录切换失败: ${err.message}`));
+            return;
+          }
+          
+          let stdout = '';
+          stream.on('data', (data) => {
+            stdout += data.toString();
+          });
+          
+          stream.on('close', (code) => {
+            clearTimeout(timeoutId);
+            if (code === 0) {
+              resolve(stdout.trim());
+            } else {
+              reject(new Error('目录不存在或无权限'));
+            }
+          });
+        });
+      });
+      
+      // 更新工作目录
+      const oldDirectory = session.workingDirectory;
+      session.workingDirectory = result;
+      session.lastActivity = getCurrentTimestamp();
+      
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: `✅ 工作目录重置成功
+
+🔗 会话信息:
+- 会话ID: ${sessionId}
+- 会话名称: ${session.name}
+- 原工作目录: ${oldDirectory}
+- 新工作目录: ${result}
+- 重置时间: ${session.lastActivity}
+
+💡 现在可以在新的工作目录下执行命令了！` 
+          }
+        ]
+      };
+      
+    } catch (error) {
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: `❌ 工作目录重置失败: ${error.message}
+
+🔗 会话ID: ${sessionId}
+📝 目标目录: ${directory}
+
+💡 请检查目录路径是否正确，或确认用户权限是否足够。` 
+          }
+        ]
+      };
+    }
+  }
+);
+
+// 注册调试工具
+server.registerTool("debug_session",
+  {
+    title: "调试SSH会话",
+    description: "调试SSH会话的内部状态和命令执行",
+    inputSchema: { 
+      sessionId: z.string().min(1, "会话ID不能为空").describe("要调试的SSH会话ID"),
+      command: z.string().optional().describe("要测试的命令（可选）")
+    }
+  },
+  async ({ sessionId, command }) => {
+    try {
+      // 检查会话是否存在
+      const session = sshSessions.get(sessionId);
+      if (!session) {
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 调试失败: 未找到会话ID为 ${sessionId} 的SSH会话` 
+            }
+          ]
+        };
+      }
+      
+      // 获取连接信息
+      const connection = sshConnections.get(session.connectionId);
+      if (!connection) {
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 调试失败: 连接已断开` 
+            }
+          ]
+        };
+      }
+      
+      let debugInfo = `🔍 SSH会话调试信息
+
+🔗 会话状态:
+- 会话ID: ${session.id}
+- 会话名称: ${session.name}
+- 当前工作目录: ${session.workingDirectory}
+- 连接状态: ${connection.client.closed ? '已断开' : '活跃'}
+- 会话状态: ${session.isActive ? '活跃' : '已关闭'}
+
+📝 命令历史 (最近5条):
+${session.commandHistory.slice(-5).map((hist, index) => {
+  const time = new Date(hist.timestamp).toLocaleTimeString();
+  const status = hist.exitCode === 0 ? '✅' : '❌';
+  return `${index + 1}. ${time} ${status} \`${hist.command}\` (${hist.workingDirectory})`;
+}).join('\n') || '无命令历史'}`;
+
+      // 如果提供了测试命令，执行它
+      if (command) {
+        debugInfo += `\n\n🧪 测试命令: \`${command}\``;
+        
+        try {
+          // 构建测试命令
+          let testCommand = command;
+          let shouldUpdateWorkingDirectory = false;
+          
+          if (command.trim().startsWith('cd ')) {
+            const targetDir = command.trim().substring(3).trim();
+            shouldUpdateWorkingDirectory = true;
+            
+            if (targetDir.startsWith('/')) {
+              testCommand = `cd ${targetDir} && pwd`;
+            } else if (targetDir === '-' || targetDir === '~') {
+              testCommand = `cd ${targetDir} && pwd`;
+            } else {
+              testCommand = `cd ${session.workingDirectory}/${targetDir} && pwd`;
+            }
+          } else {
+            if (session.workingDirectory !== '/root') {
+              testCommand = `cd ${session.workingDirectory} && ${command}`;
+            }
+          }
+          
+          debugInfo += `\n🔧 实际执行命令: \`${testCommand}\``;
+          debugInfo += `\n📁 预期工作目录: ${session.workingDirectory}`;
+          
+          // 执行测试命令
+          const result = await new Promise((resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+              reject(new Error('命令执行超时'));
+            }, 5000);
+            
+            connection.client.exec(testCommand, (err, stream) => {
+              if (err) {
+                clearTimeout(timeoutId);
+                reject(new Error(`命令执行错误: ${err.message}`));
+                return;
+              }
+              
+              let stdout = '';
+              let stderr = '';
+              
+              stream.on('data', (data) => {
+                stdout += data.toString();
+              });
+              
+              stream.stderr.on('data', (data) => {
+                stderr += data.toString();
+              });
+              
+              stream.on('close', (code) => {
+                clearTimeout(timeoutId);
+                resolve({
+                  code,
+                  stdout: stdout.trim(),
+                  stderr: stderr.trim()
+                });
+              });
+            });
+          });
+          
+          debugInfo += `\n\n📊 测试结果:
+- 退出码: ${result.code}
+- 标准输出: ${result.stdout || '[无输出]'}
+- 错误输出: ${result.stderr || '[无输出]'}`;
+          
+          if (shouldUpdateWorkingDirectory && result.code === 0) {
+            const lines = result.stdout.split('\n');
+            const newDir = lines[lines.length - 1].trim();
+            if (newDir && newDir.startsWith('/')) {
+              debugInfo += `\n✅ 工作目录将更新为: ${newDir}`;
+            }
+          }
+          
+        } catch (error) {
+          debugInfo += `\n\n❌ 测试命令执行失败: ${error.message}`;
+        }
+      }
+      
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: debugInfo
+          }
+        ]
+      };
+      
+    } catch (error) {
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: `❌ 调试失败: ${error.message}` 
+          }
+        ]
+      };
+    }
+  }
+);
+
+// 注册会话关闭工具
+server.registerTool("close_session",
+  {
+    title: "关闭SSH会话",
+    description: "关闭指定的交互式SSH会话",
+    inputSchema: { 
+      sessionId: z.string().min(1, "会话ID不能为空").describe("要关闭的SSH会话ID")
+    }
+  },
+  async ({ sessionId }) => {
+    try {
+      // 检查会话是否存在
+      const session = sshSessions.get(sessionId);
+      if (!session) {
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 关闭失败: 未找到会话ID为 ${sessionId} 的SSH会话
+
+💡 请检查会话ID是否正确，或使用 get_session_info 工具查看当前会话状态。` 
+            }
+          ]
+        };
+      }
+      
+      // 计算会话时长
+      const startedAt = new Date(session.startedAt);
+      const closedAt = new Date();
+      const duration = Math.floor((closedAt - startedAt) / 1000);
+      
+      // 关闭会话
+      session.isActive = false;
+      session.lastActivity = getCurrentTimestamp();
+      
+      // 清理会话
+      sshSessions.delete(sessionId);
+      
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: `✅ SSH会话已关闭
+
+🔗 会话信息:
+- 会话ID: ${sessionId}
+- 会话名称: ${session.name}
+- 会话时长: ${duration}秒
+- 执行命令数: ${session.commandHistory.length}
+- 关闭时间: ${closedAt.toISOString()}
+
+📊 当前状态: ${sshSessions.size} 个活跃会话
+
+💡 如需继续使用，请重新启动会话。` 
+          }
+        ]
+      };
+      
+    } catch (error) {
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: `❌ 关闭会话失败: ${error.message}
+
+🔗 会话ID: ${sessionId}
+
+💡 请检查会话状态，或尝试强制关闭会话。` 
+          }
+        ]
+      };
+    }
+  }
+);
+
 // 注册SSH统计信息工具
 server.registerTool("get_ssh_stats",
   {
@@ -944,6 +1918,19 @@ server.registerTool("get_ssh_stats",
           .join('\n\n');
       }
       
+      // 格式化活跃会话信息
+      let activeSessionsText = '无活跃会话';
+      if (sshSessions.size > 0) {
+        activeSessionsText = Array.from(sshSessions.values())
+          .map(sess => {
+            const startedAt = new Date(sess.startedAt);
+            const now = new Date();
+            const duration = Math.floor((now - startedAt) / 1000);
+            return `- ${sess.name} (ID: ${sess.id})\n  工作目录: ${sess.workingDirectory}\n  会话时长: ${duration}秒\n  命令数: ${sess.commandHistory.length}`;
+          })
+          .join('\n\n');
+      }
+      
       return {
         content: [
           {
@@ -965,12 +1952,19 @@ server.registerTool("get_ssh_stats",
 📋 活跃连接详情:
 ${activeConnectionsText}
 
+📋 活跃会话详情:
+${activeSessionsText}
+
 💡 使用说明:
 1. connect_ssh - 建立SSH连接
-2. execute_command - 执行远程命令
-3. file_operation - 文件操作（上传/下载/列表/删除/创建目录）
-4. disconnect_ssh - 断开SSH连接
-5. get_ssh_stats - 查看统计信息
+2. interactive_ssh - 启动交互式SSH终端会话
+3. execute_in_session - 在会话中执行命令（推荐）
+4. execute_command - 执行远程命令（独立执行）
+5. file_operation - 文件操作（上传/下载/列表/删除/创建目录）
+6. disconnect_ssh - 断开SSH连接
+7. get_ssh_stats - 查看统计信息
+8. debug_session - 调试会话状态和命令执行
+9. reset_working_directory - 重置工作目录
 
 📁 文件操作支持:
 - upload: 上传本地文件到服务器
@@ -978,7 +1972,13 @@ ${activeConnectionsText}
 - list: 查看服务器目录内容
 - delete: 删除服务器文件
 - mkdir: 创建服务器目录
-- rmdir: 删除服务器目录`
+- rmdir: 删除服务器目录
+
+🖥️ 交互式终端支持:
+- 工作目录保持
+- 命令历史记录
+- 会话状态管理
+- 环境变量保持`
           }
         ]
       };
