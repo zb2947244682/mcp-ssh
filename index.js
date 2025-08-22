@@ -7,8 +7,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 // 导入 SSH2 库，用于SSH连接和命令执行
 import { Client } from "ssh2";
-// 导入文件系统模块，用于读取私钥文件
-import { readFileSync } from "fs";
+// 导入文件系统模块，用于读取私钥文件和文件传输
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { join, dirname, basename } from "path";
 
 // 创建一个 MCP 服务器实例
 // 配置服务器的名称和版本
@@ -574,6 +575,350 @@ server.registerTool("disconnect_ssh",
   }
 );
 
+// 注册文件操作工具（上传、下载、列表、删除等）
+server.registerTool("file_operation",
+  {
+    title: "SSH文件操作",
+    description: "支持文件上传、下载、列表查看、删除等操作",
+    inputSchema: { 
+      connectionId: z.string().min(1, "连接ID不能为空").describe("SSH连接的ID"),
+      operation: z.enum(["upload", "download", "list", "delete", "mkdir", "rmdir"]).describe("操作类型"),
+      remotePath: z.string().min(1, "远程路径不能为空").describe("远程文件/目录路径"),
+      localPath: z.string().optional().describe("本地文件/目录路径（上传/下载时需要）"),
+      timeout: z.number().min(10000).max(300000).default(30000).describe("操作超时时间(毫秒)")
+    }
+  },
+  async ({ connectionId, operation, remotePath, localPath, timeout = 30000 }) => {
+    const startTime = Date.now();
+    
+    try {
+      // 检查连接是否存在
+      const connection = sshConnections.get(connectionId);
+      if (!connection) {
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 操作失败: 未找到连接ID为 ${connectionId} 的SSH连接
+
+💡 请使用 connect_ssh 工具建立连接，或检查连接ID是否正确。` 
+            }
+          ]
+        };
+      }
+      
+      // 检查连接是否仍然活跃
+      if (!connection.client || connection.client.closed) {
+        cleanupConnection(connectionId);
+        return {
+          content: [
+            { 
+              type: "text", 
+              text: `❌ 操作失败: SSH连接已断开
+
+🔗 连接信息:
+- 连接ID: ${connectionId}
+- 连接名称: ${connection.name}
+- 服务器: ${connection.host}:${connection.port}
+
+💡 请重新使用 connect_ssh 工具建立连接。` 
+            }
+          ]
+        };
+      }
+      
+      let result;
+      
+      switch (operation) {
+        case "upload":
+          if (!localPath) {
+            throw new Error("上传操作需要指定本地文件路径");
+          }
+          if (!existsSync(localPath)) {
+            throw new Error(`本地文件不存在: ${localPath}`);
+          }
+          result = await uploadFile(connection.client, localPath, remotePath, timeout);
+          break;
+          
+        case "download":
+          if (!localPath) {
+            throw new Error("下载操作需要指定本地保存路径");
+          }
+          result = await downloadFile(connection.client, remotePath, localPath, timeout);
+          break;
+          
+        case "list":
+          result = await listFiles(connection.client, remotePath, timeout);
+          break;
+          
+        case "delete":
+          result = await deleteFile(connection.client, remotePath, timeout);
+          break;
+          
+        case "mkdir":
+          result = await createDirectory(connection.client, remotePath, timeout);
+          break;
+          
+        case "rmdir":
+          result = await removeDirectory(connection.client, remotePath, timeout);
+          break;
+          
+        default:
+          throw new Error(`不支持的操作类型: ${operation}`);
+      }
+      
+      // 更新连接统计
+      connection.lastActivity = getCurrentTimestamp();
+      
+      const executionTime = Date.now() - startTime;
+      updateConnectionStats('command_success', executionTime);
+      
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: `✅ 文件操作成功完成
+
+🔗 连接信息:
+- 连接ID: ${connectionId}
+- 连接名称: ${connection.name}
+- 服务器: ${connection.host}:${connection.port}
+- 操作类型: ${operation}
+- 执行时间: ${executionTime}ms
+
+📋 操作详情:
+${result}
+
+📊 连接统计:
+- 最后活动: ${connection.lastActivity}` 
+          }
+        ]
+      };
+      
+    } catch (error) {
+      const executionTime = Date.now() - startTime;
+      updateConnectionStats('command_failed');
+      
+      return {
+        content: [
+          { 
+            type: "text", 
+            text: `❌ 文件操作失败: ${error.message}
+
+⏱️ 执行时间: ${executionTime}ms
+🔗 连接ID: ${connectionId}
+📝 操作类型: ${operation}
+🌐 远程路径: ${remotePath}
+💻 本地路径: ${localPath || '未指定'}
+
+💡 可能的原因:
+1. 文件路径不存在或权限不足
+2. 网络连接问题
+3. 操作超时
+4. SSH连接已断开
+
+🔍 建议:
+1. 检查文件路径是否正确
+2. 确认用户权限是否足够
+3. 尝试重新连接SSH` 
+          }
+        ]
+      };
+    }
+  }
+);
+
+// 文件上传函数
+async function uploadFile(client, localPath, remotePath, timeout) {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      reject(new Error(`文件上传超时 (${timeout}ms)`));
+    }, timeout);
+    
+    try {
+      const fileContent = readFileSync(localPath);
+      
+      client.sftp((err, sftp) => {
+        if (err) {
+          clearTimeout(timeoutId);
+          reject(new Error(`SFTP初始化失败: ${err.message}`));
+          return;
+        }
+        
+        sftp.writeFile(remotePath, fileContent, (writeErr) => {
+          clearTimeout(timeoutId);
+          if (writeErr) {
+            reject(new Error(`文件上传失败: ${writeErr.message}`));
+            return;
+          }
+          
+          const stats = fileContent.length;
+          resolve(`文件上传成功: ${localPath} → ${remotePath}\n文件大小: ${(stats / 1024).toFixed(2)} KB`);
+        });
+      });
+    } catch (error) {
+      clearTimeout(timeoutId);
+      reject(new Error(`读取本地文件失败: ${error.message}`));
+    }
+  });
+}
+
+// 文件下载函数
+async function downloadFile(client, remotePath, localPath, timeout) {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      reject(new Error(`文件下载超时 (${timeout}ms)`));
+    }, timeout);
+    
+    try {
+      // 确保本地目录存在
+      const localDir = dirname(localPath);
+      if (!existsSync(localDir)) {
+        mkdirSync(localDir, { recursive: true });
+      }
+      
+      client.sftp((err, sftp) => {
+        if (err) {
+          clearTimeout(timeoutId);
+          reject(new Error(`SFTP初始化失败: ${err.message}`));
+          return;
+        }
+        
+        sftp.readFile(remotePath, (readErr, data) => {
+          clearTimeout(timeoutId);
+          if (readErr) {
+            reject(new Error(`文件下载失败: ${readErr.message}`));
+            return;
+          }
+          
+          try {
+            writeFileSync(localPath, data);
+            const stats = data.length;
+            resolve(`文件下载成功: ${remotePath} → ${localPath}\n文件大小: ${(stats / 1024).toFixed(2)} KB`);
+          } catch (writeError) {
+            reject(new Error(`写入本地文件失败: ${writeError.message}`));
+          }
+        });
+      });
+    } catch (error) {
+      clearTimeout(timeoutId);
+      reject(new Error(`准备下载失败: ${error.message}`));
+    }
+  });
+}
+
+// 文件列表函数
+async function listFiles(client, remotePath, timeout) {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      reject(new Error(`文件列表获取超时 (${timeout}ms)`));
+    }, timeout);
+    
+    client.sftp((err, sftp) => {
+      if (err) {
+        clearTimeout(timeoutId);
+        reject(new Error(`SFTP初始化失败: ${err.message}`));
+        return;
+      }
+      
+      sftp.readdir(remotePath, (readErr, list) => {
+        clearTimeout(timeoutId);
+        if (readErr) {
+          reject(new Error(`获取文件列表失败: ${readErr.message}`));
+          return;
+        }
+        
+        const files = list.map(item => {
+          const type = item.attrs.isDirectory() ? '📁' : '📄';
+          const size = item.attrs.isDirectory() ? '-' : `${(item.attrs.size / 1024).toFixed(2)} KB`;
+          const date = new Date(item.attrs.mtime * 1000).toLocaleString();
+          return `${type} ${item.filename.padEnd(20)} ${size.padStart(10)} ${date}`;
+        });
+        
+        resolve(`目录: ${remotePath}\n\n${files.join('\n')}`);
+      });
+    });
+  });
+}
+
+// 删除文件函数
+async function deleteFile(client, remotePath, timeout) {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      reject(new Error(`文件删除超时 (${timeout}ms)`));
+    }, timeout);
+    
+    client.sftp((err, sftp) => {
+      if (err) {
+        clearTimeout(timeoutId);
+        reject(new Error(`SFTP初始化失败: ${err.message}`));
+        return;
+      }
+      
+      sftp.unlink(remotePath, (unlinkErr) => {
+        clearTimeout(timeoutId);
+        if (unlinkErr) {
+          reject(new Error(`文件删除失败: ${unlinkErr.message}`));
+          return;
+        }
+        resolve(`文件删除成功: ${remotePath}`);
+      });
+    });
+  });
+}
+
+// 创建目录函数
+async function createDirectory(client, remotePath, timeout) {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      reject(new Error(`目录创建超时 (${timeout}ms)`));
+    }, timeout);
+    
+    client.sftp((err, sftp) => {
+      if (err) {
+        clearTimeout(timeoutId);
+        reject(new Error(`SFTP初始化失败: ${err.message}`));
+        return;
+      }
+        
+      sftp.mkdir(remotePath, (mkdirErr) => {
+        clearTimeout(timeoutId);
+        if (mkdirErr) {
+          reject(new Error(`目录创建失败: ${mkdirErr.message}`));
+          return;
+        }
+        resolve(`目录创建成功: ${remotePath}`);
+      });
+    });
+  });
+}
+
+// 删除目录函数
+async function removeDirectory(client, remotePath, timeout) {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      reject(new Error(`目录删除超时 (${timeout}ms)`));
+    }, timeout);
+    
+    client.sftp((err, sftp) => {
+      if (err) {
+        clearTimeout(timeoutId);
+        reject(new Error(`SFTP初始化失败: ${err.message}`));
+        return;
+      }
+      
+      sftp.rmdir(remotePath, (rmdirErr) => {
+        clearTimeout(timeoutId);
+        if (rmdirErr) {
+          reject(new Error(`目录删除失败: ${rmdirErr.message}`));
+          return;
+        }
+        resolve(`目录删除成功: ${remotePath}`);
+      });
+    });
+  });
+}
+
 // 注册SSH统计信息工具
 server.registerTool("get_ssh_stats",
   {
@@ -623,8 +968,17 @@ ${activeConnectionsText}
 💡 使用说明:
 1. connect_ssh - 建立SSH连接
 2. execute_command - 执行远程命令
-3. disconnect_ssh - 断开SSH连接
-4. get_ssh_stats - 查看统计信息`
+3. file_operation - 文件操作（上传/下载/列表/删除/创建目录）
+4. disconnect_ssh - 断开SSH连接
+5. get_ssh_stats - 查看统计信息
+
+📁 文件操作支持:
+- upload: 上传本地文件到服务器
+- download: 从服务器下载文件到本地
+- list: 查看服务器目录内容
+- delete: 删除服务器文件
+- mkdir: 创建服务器目录
+- rmdir: 删除服务器目录`
           }
         ]
       };
