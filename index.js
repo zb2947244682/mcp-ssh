@@ -7,6 +7,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 // 导入 SSH2 库，用于SSH连接和命令执行
 import { Client } from "ssh2";
+// 导入文件系统模块，用于读取私钥文件
+import { readFileSync } from "fs";
 
 // 创建一个 MCP 服务器实例
 // 配置服务器的名称和版本
@@ -85,12 +87,13 @@ server.registerTool("connect_ssh",
       host: z.string().min(1, "主机地址不能为空"),
       port: z.number().min(1).max(65535).default(22).describe("SSH端口号"),
       username: z.string().min(1, "用户名不能为空"),
-      privateKey: z.string().min(1, "私钥内容不能为空").describe("SSH私钥内容（PEM格式）"),
+      privateKey: z.string().optional().describe("SSH私钥内容（PEM格式）"),
+      privateKeyPath: z.string().optional().describe("SSH私钥文件路径（绝对路径）"),
       passphrase: z.string().optional().describe("私钥密码（如果有的话）"),
       connectionName: z.string().optional().describe("连接名称（用于标识连接）")
     }
   },
-  async ({ host, port = 22, username, privateKey, passphrase, connectionName }) => {
+  async ({ host, port = 22, username, privateKey, privateKeyPath, passphrase, connectionName }) => {
     const startTime = Date.now();
     
     try {
@@ -108,6 +111,25 @@ server.registerTool("connect_ssh",
             };
           }
         }
+      }
+      
+      // 读取私钥内容
+      let privateKeyContent = privateKey;
+      
+      // 如果提供了私钥路径，则从文件读取
+      if (privateKeyPath) {
+        try {
+          console.log(`[DEBUG] 正在读取私钥文件: ${privateKeyPath}`);
+          privateKeyContent = readFileSync(privateKeyPath, 'utf8');
+          console.log(`[DEBUG] 私钥文件读取成功，长度: ${privateKeyContent.length} 字符`);
+        } catch (readError) {
+          throw new Error(`无法读取私钥文件 ${privateKeyPath}: ${readError.message}`);
+        }
+      }
+      
+      // 检查是否提供了私钥内容
+      if (!privateKeyContent) {
+        throw new Error('必须提供私钥内容或私钥文件路径');
       }
       
       // 创建SSH客户端
@@ -132,7 +154,7 @@ server.registerTool("connect_ssh",
         host,
         port,
         username,
-        privateKey: Buffer.from(privateKey, 'utf8'),
+        privateKey: Buffer.from(privateKeyContent, 'utf8'),
         readyTimeout: 5000, // 5秒超时
         keepaliveInterval: 5000, // 5秒心跳
         keepaliveCountMax: 3,
@@ -147,8 +169,8 @@ server.registerTool("connect_ssh",
       };
       
       // 验证私钥格式
-      if (!privateKey.includes('-----BEGIN OPENSSH PRIVATE KEY-----') || 
-          !privateKey.includes('-----END OPENSSH PRIVATE KEY-----')) {
+      if (!privateKeyContent.includes('-----BEGIN OPENSSH PRIVATE KEY-----') || 
+          !privateKeyContent.includes('-----END OPENSSH PRIVATE KEY-----')) {
         throw new Error('私钥格式错误：必须是OpenSSH格式的PEM私钥');
       }
       
@@ -261,6 +283,10 @@ server.registerTool("connect_ssh",
 2. 使用 disconnect_ssh 工具断开连接，传入 connectionId: "${connectionId}"
 3. 连接会自动保持活跃状态，支持长时间会话
 
+🔑 私钥支持两种方式:
+- 直接输入私钥内容 (privateKey 参数)
+- 提供私钥文件路径 (privateKeyPath 参数，推荐)
+
 📊 当前状态: ${sshConnections.size} 个活跃连接` 
           }
         ]
@@ -279,7 +305,8 @@ server.registerTool("connect_ssh",
 🔍 连接参数:
 - 主机: ${host}:${port}
 - 用户名: ${username}
-- 私钥长度: ${privateKey.length} 字符
+- 私钥来源: ${privateKeyPath ? `文件路径: ${privateKeyPath}` : '直接输入'}
+- 私钥长度: ${privateKeyContent ? privateKeyContent.length : 0} 字符
 
 💡 常见问题排查:
 1. 检查主机地址和端口是否正确
