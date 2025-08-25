@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 智能发版工具 (基于 npm version)
-支持三种发布类型：BUG修复、小功能更新、大版本更新
+支持四种发布类型：BUG修复、小功能更新、大版本更新、直接发布
 利用 npm 原生的版本管理功能
 """
 
@@ -184,16 +184,17 @@ def main():
     print("1. 🐛 BUG修复 (patch: x.y.z -> x.y.z+1)")
     print("2. ✨ 小功能更新 (minor: x.y.z -> x.y+1.0)")
     print("3. 🎉 大版本更新 (major: x.y.z -> x+1.0.0)")
+    print("4. 🚀 直接发布 (保持当前版本号不变)")
     print()
     
     # 获取用户选择
     while True:
         try:
-            choice = input("请输入选择 (1/2/3): ").strip()
-            if choice in ['1', '2', '3']:
+            choice = input("请输入选择 (1/2/3/4): ").strip()
+            if choice in ['1', '2', '3', '4']:
                 break
             else:
-                print("⚠️  无效选择，请输入 1、2 或 3")
+                print("⚠️  无效选择，请输入 1、2、3 或 4")
         except KeyboardInterrupt:
             print("\n\n👋 操作已取消")
             sys.exit(0)
@@ -202,7 +203,8 @@ def main():
     release_types = {
         '1': ('patch', 'BUG修复'),
         '2': ('minor', '小功能更新'),
-        '3': ('major', '大版本更新')
+        '3': ('major', '大版本更新'),
+        '4': ('direct', '直接发布')
     }
     
     release_type, release_name = release_types[choice]
@@ -213,22 +215,53 @@ def main():
     if not check_git_status():
         sys.exit(1)
     
-    # 第二步：使用 npm version 更新版本号和创建 Git 标签
-    version_success, version_output = run_npm_command(
-        ['version', release_type, '--git-tag-version=true'],
-        f"更新版本号 ({release_type})"
-    )
+    # 第二步：根据发布类型处理版本号
+    if release_type == 'direct':
+        # 直接发布：不更新版本号，只创建 Git 标签
+        print("🚀 直接发布模式：保持当前版本号不变")
+        new_version = current_version
+        
+        # 为当前版本创建 Git 标签（如果不存在）
+        tag_name = f"v{current_version}"
+        print(f"🏷️  为版本 {tag_name} 创建 Git 标签...")
+        
+        # 检查标签是否已存在
+        tag_check = subprocess.run([
+            'git', 'tag', '-l', tag_name
+        ], capture_output=True, text=True, encoding='utf-8')
+        
+        if tag_check.stdout.strip():
+            print(f"✅ 标签 {tag_name} 已存在")
+            version_success = True
+        else:
+            # 创建标签
+            tag_result = subprocess.run([
+                'git', 'tag', tag_name
+            ], capture_output=True, text=True, encoding='utf-8')
+            
+            if tag_result.returncode == 0:
+                print(f"✅ 标签 {tag_name} 创建成功")
+                version_success = True
+            else:
+                print(f"❌ 标签创建失败：{tag_result.stderr}")
+                version_success = False
+    else:
+        # 常规发布：使用 npm version 更新版本号和创建 Git 标签
+        version_success, version_output = run_npm_command(
+            ['version', release_type, '--git-tag-version=true'],
+            f"更新版本号 ({release_type})"
+        )
+        
+        if version_success:
+            # 从输出中提取新版本号
+            new_version = version_output.strip() if version_output else "未知"
+            if new_version.startswith('v'):
+                new_version = new_version[1:]  # 移除 'v' 前缀
+            print(f"✅ 版本号已从 {current_version} 更新为 {new_version}")
     
     if not version_success:
-        print("❌ 版本更新失败，发布终止")
+        print("❌ 版本处理失败，发布终止")
         sys.exit(1)
-    
-    # 从输出中提取新版本号
-    new_version = version_output.strip() if version_output else "未知"
-    if new_version.startswith('v'):
-        new_version = new_version[1:]  # 移除 'v' 前缀
-    
-    print(f"✅ 版本号已从 {current_version} 更新为 {new_version}")
     
     # 第三步：发布到 npm
     publish_success, _ = run_npm_command(
@@ -247,7 +280,12 @@ def main():
     print("               📊 发布结果")
     print("=" * 50)
     print(f"发布类型：{release_name}")
-    print(f"新版本：{new_version}")
+    
+    if release_type == 'direct':
+        print(f"发布版本：{new_version} (版本号未变更)")
+    else:
+        print(f"新版本：{new_version}")
+    
     print()
     
     if publish_success:
@@ -259,7 +297,10 @@ def main():
             print("💡 你可以手动运行：git push --follow-tags")
     else:
         print("❌ npm 发布失败！")
-        print("💡 版本号已更新，你可以手动运行：npm publish --access public")
+        if release_type == 'direct':
+            print("💡 你可以手动运行：npm publish --access public")
+        else:
+            print("💡 版本号已更新，你可以手动运行：npm publish --access public")
     
     print("=" * 50)
 
