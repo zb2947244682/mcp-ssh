@@ -117,7 +117,7 @@
 您可以通过以下命令直接从命令行运行此 MCP 项目：
 
 ```bash
-npx @zb2947244682/mcp-ssh
+npx @zb2947244682/mcp-ssh@latest
 ```
 
 ## 本地开发配置
