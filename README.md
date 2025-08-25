@@ -106,7 +106,7 @@
     "command": "npx",
     "args": [
       "-y",
-      "@zb2947244682/mcp-ssh"
+      "@zb2947244682/mcp-ssh@latest"
     ]
   }
 }
