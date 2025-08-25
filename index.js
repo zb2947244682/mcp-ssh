@@ -687,4 +687,4 @@ async function removeDirectory(client, remotePath, timeout) {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.log("MCP SSH服务已启动");
+//console.log("MCP SSH服务已启动");
